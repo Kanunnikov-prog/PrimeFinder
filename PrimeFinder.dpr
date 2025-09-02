@@ -33,7 +33,8 @@ type
   private
     FBuffer: TList<Integer>;
     FLock: TCriticalSection;
-    procedure WriteRecordsToFile(const FileName: string);
+    FOldCount: Integer;
+    procedure WriteRecordsToFile(Buffer: TList<Integer>; const FileName: string);
   protected
     procedure Execute; override;
   public
@@ -162,21 +163,21 @@ begin
   FreeOnTerminate := False; // Не уничтожаем поток автоматически
   FBuffer := TList<Integer>.Create();
   FLock := TCriticalSection.Create();
+  FOldCount := 0;
   Resume; // Запускаем поток
 end;
 
 // Процедура записи результатов в файл
-procedure TFileWriterThread.WriteRecordsToFile(const FileName: string);
+procedure TFileWriterThread.WriteRecordsToFile(Buffer: TList<Integer>; const FileName: string);
 var
   f: TextFile;
-  Prime: Integer;
+  Prime, i: Integer;
 begin
   try
     AssignFile(f, FileName);
     Rewrite(f);
     try
-      // Записываем все числа из буфера в файл через пробел
-      for Prime in FBuffer do
+      for Prime in Buffer do
         Write(f, Format('%d ', [Prime]));
     finally
       CloseFile(f);
@@ -192,17 +193,40 @@ end;
 // минусы такой записи - нагрузка на диск
 // Если бы не требование задания, то можно было бы объединить буферы всех потоков в конце и записать файл.
 procedure TFileWriterThread.Execute;
-const
-  OldCount: Integer = 0;
+var
+  LocalCopy: TList<Integer>;
 begin
   while not Terminated do
   begin
-    if (FBuffer.Count > 0) and (FBuffer.Count > OldCount) then
+    LocalCopy := nil;
+    FLock.Enter;
+    try
+      if (FBuffer.Count > 0) and (FBuffer.Count > FOldCount) then
+      begin
+        // Создаем новый пустой список
+        LocalCopy := TList<Integer>.Create;
+        try
+          // Добавляем все элементы буфера в новый список
+          LocalCopy.AddRange(FBuffer.ToArray);
+          FOldCount := FBuffer.Count;
+        except
+          on E: Exception do
+            Writeln('Ошибка копирования буфера: ' + E.Message);
+        end;
+      end;
+    finally
+      FLock.Leave;
+    end;
+
+    if LocalCopy <> nil then
     begin
-      // Сортируем буфер перед записью
-      FBuffer.Sort;
-      WriteRecordsToFile('Result.txt');
-      OldCount := FBuffer.Count;
+      try
+        // Сортируем буфер перед записью
+        LocalCopy.Sort;
+        WriteRecordsToFile(LocalCopy, 'Result.txt');
+      finally
+        LocalCopy.Free;
+      end;
     end
     else
       Sleep(100); // Короткий сон, если нечего писать
@@ -324,6 +348,16 @@ begin
       // Ждём завершения потока записи
       WriterThread.Terminate;
       WriterThread.WaitFor;
+
+      // Сначала допишем данные, а потом удалим поток
+      with WriterThread do
+      begin
+        if (FBuffer.Count > 0) and (FBuffer.Count > FOldCount) then
+        begin
+          FBuffer.Sort;
+          WriteRecordsToFile(FBuffer, 'Result.txt');
+        end;
+      end;
 
       // Освобождаем потоки
       WriterThread.Free;
